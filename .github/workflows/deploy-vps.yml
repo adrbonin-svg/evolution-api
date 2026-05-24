@@ -1,0 +1,140 @@
+name: 🚀 Deploy → crm.autoprimetech.com.br
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Forçar deploy mesmo sem mudanças'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ─── Verificar qualidade do código ──────────────────────────────
+  quality:
+    name: 🔍 Lint & Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: ✅ Checkout
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 📥 Instalar dependências
+        run: npm ci
+
+      - name: 🔍 Lint
+        run: npm run lint:check
+        continue-on-error: true
+
+      - name: 🏗️ Build
+        run: npm run build
+
+  # ─── Deploy no VPS Hostinger ────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy VPS Hostinger
+    runs-on: ubuntu-latest
+    needs: quality
+    environment: production
+
+    steps:
+      - name: ✅ Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configurar SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HOSTINGER_SSH_KEY }}
+
+      - name: 🌐 Adicionar host ao known_hosts
+        run: |
+          ssh-keyscan -p ${{ secrets.HOSTINGER_PORT || 22 }} ${{ secrets.HOSTINGER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: 🚀 Deploy via SSH
+        run: |
+          ssh ${{ secrets.HOSTINGER_USER }}@${{ secrets.HOSTINGER_HOST }} -p ${{ secrets.HOSTINGER_PORT || 22 }} << 'DEPLOY_SCRIPT'
+            set -e
+
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH || '/var/www/evolution-api' }}"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🚀 Iniciando deploy - $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "📂 Diretório: $DEPLOY_PATH"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            cd "$DEPLOY_PATH"
+
+            # Backup do .env atual
+            if [ -f .env ]; then
+              cp .env .env.backup.$(date +%Y%m%d_%H%M%S)
+              echo "✅ Backup do .env criado"
+            fi
+
+            # Pull do código
+            echo "⬇️  Atualizando código..."
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Rebuild e restart dos containers
+            echo "🐳 Rebuild dos containers..."
+            docker compose -f docker-compose.prod.yml pull --quiet
+            docker compose -f docker-compose.prod.yml up -d --build --remove-orphans --wait
+
+            # Aguardar serviços ficarem healthy
+            echo "⏳ Verificando saúde dos serviços..."
+            sleep 15
+
+            # Health check da Evolution API
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080 || echo "000")
+            if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "404" ]; then
+              echo "✅ Evolution API respondendo (HTTP $HTTP_STATUS)"
+            else
+              echo "⚠️  Evolution API pode ainda estar iniciando (HTTP $HTTP_STATUS)"
+            fi
+
+            # Limpar imagens antigas
+            docker image prune -f --filter "until=24h" > /dev/null 2>&1 || true
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "✅ Deploy concluído com sucesso!"
+            echo "🌐 https://crm.autoprimetech.com.br"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          DEPLOY_SCRIPT
+
+      - name: 📊 Status dos containers
+        if: always()
+        run: |
+          ssh ${{ secrets.HOSTINGER_USER }}@${{ secrets.HOSTINGER_HOST }} -p ${{ secrets.HOSTINGER_PORT || 22 }} \
+            "cd ${{ secrets.DEPLOY_PATH || '/var/www/evolution-api' }} && docker compose -f docker-compose.prod.yml ps"
+
+      - name: 📣 Notificar WhatsApp — Sucesso
+        if: success()
+        run: |
+          curl -s -X POST "${{ secrets.EVOLUTION_API_URL }}/message/sendText/${{ secrets.EVOLUTION_INSTANCE_NAME }}" \
+            -H "apikey: ${{ secrets.EVOLUTION_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"number\": \"${{ secrets.NOTIFY_WHATSAPP_NUMBER }}\",
+              \"text\": \"✅ *Deploy realizado com sucesso!*\n\n📦 *Commit:* \`${{ github.sha }}\`\n👤 *Por:* ${{ github.actor }}\n🌿 *Branch:* ${{ github.ref_name }}\n🕐 *Horário:* $(date '+%d/%m/%Y %H:%M')\n🌐 https://crm.autoprimetech.com.br\"
+            }" || echo "Notificação WhatsApp não enviada (opcional)"
+
+      - name: 📣 Notificar WhatsApp — Falha
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.EVOLUTION_API_URL }}/message/sendText/${{ secrets.EVOLUTION_INSTANCE_NAME }}" \
+            -H "apikey: ${{ secrets.EVOLUTION_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"number\": \"${{ secrets.NOTIFY_WHATSAPP_NUMBER }}\",
+              \"text\": \"❌ *FALHA no Deploy!*\n\n📦 *Commit:* \`${{ github.sha }}\`\n👤 *Por:* ${{ github.actor }}\n🔗 Verifique: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }" || echo "Notificação WhatsApp não enviada (opcional)"
