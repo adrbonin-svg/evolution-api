@@ -46,3 +46,7 @@ lerna-debug.log*
 .tool-versions
 
 /prisma/migrations/*
+
+# Credenciais locais - NUNCA commitar
+.credentials-VPS.txt
+.env.backup.*
